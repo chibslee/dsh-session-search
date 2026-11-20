@@ -1,0 +1,57 @@
+{
+  "name": "dsh-session-search",
+  "version": "0.1.0",
+  "type": "module",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/en.json",
+    "locale/zh.json",
+    "icon.svg",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-api-session-controller",
+        "@deepseek-ai/dsh-client-ui-layout",
+        "@deepseek-ai/dsh-client-ui-sidebar",
+        "@deepseek-ai/dsh-client-ui-workspace",
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
+    }
+  },
+  "description": "DSH sidebar panel: local full-text search across every session record, with per-message hits and click-to-locate. No model calls.",
+  "license": "MIT",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "search",
+    "session-search",
+    "full-text",
+    "sqlite",
+    "fts5"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/chibslee/dsh-session-search.git"
+  },
+  "bugs": {
+    "url": "https://github.com/chibslee/dsh-session-search/issues"
+  },
+  "homepage": "https://github.com/chibslee/dsh-session-search#readme"
+}

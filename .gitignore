@@ -1,0 +1,9 @@
+node_modules/
+*.log
+.DS_Store
+*.tgz
+.settings/
+# 本地索引与偏好，不进仓库
+session-query.sqlite
+session-query.sqlite-wal
+session-query.sqlite-shm

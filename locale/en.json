@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Session full-text search",
+    "description": "Locally search session records, scoped to the current session or all history, with click-to-locate results."
+  }
+}
