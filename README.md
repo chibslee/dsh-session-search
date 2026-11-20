@@ -25,9 +25,13 @@
 ## 安装
 
 ```bash
-dsh plugin --profile <profile> add github:chibslee/dsh-session-search
-# 发布到 npm 之后也可以：
 dsh plugin --profile <profile> add dsh-keyword-searcher
+```
+
+或直接从仓库装（等价，跳过 npm）：
+
+```bash
+dsh plugin --profile <profile> add github:chibslee/dsh-session-search
 ```
 
 本地开发用链接方式：
