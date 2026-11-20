@@ -40,6 +40,14 @@ dsh plugin --profile <profile> add github:chibslee/dsh-session-search
 dsh plugin --profile <profile> add /absolute/path/to/dsh-session-search
 ```
 
+> **装不上时**：如果报 `ERR_PNPM_TARBALL_EXTRACT … dsh-keyword-searcher-0.0.0-stage.tgz`，是淘宝镜像（`registry.npmmirror.com`）缓存了首次发布时的 `0.0.0-stage` 占位文档。换源装：
+>
+> ```bash
+> dsh plugin --profile <profile> add dsh-keyword-searcher --registry=https://registry.npmjs.org
+> ```
+>
+> 或等镜像同步完再试。
+
 装完重启一次 DSH（host 侧路由要跟着起），之后左侧栏出现「会话全文搜索」入口。
 
 ## 用法
