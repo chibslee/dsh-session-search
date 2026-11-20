@@ -1,3 +1,3 @@
 - insert:
-    - id: 'dsh-session-finder:view'
-      name: 'dsh-session-finder'
+    - id: 'dsh-keyword-searcher:view'
+      name: 'dsh-keyword-searcher'

@@ -1,5 +1,5 @@
 {
-  "name": "dsh-session-finder",
+  "name": "dsh-keyword-searcher",
   "version": "0.1.1",
   "type": "module",
   "exports": {
@@ -45,7 +45,7 @@
     "full-text",
     "sqlite",
     "fts5",
-    "session-finder"
+    "keyword-search"
   ],
   "repository": {
     "type": "git",

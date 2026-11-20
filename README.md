@@ -1,4 +1,4 @@
-# dsh-session-finder
+# dsh-keyword-searcher
 
 给 DeepSeek Harness（DSH）用的**会话全文搜索**插件：左侧栏一个搜索面板 + 会话页内一个 `⌘F` 查找条，全部本地匹配，不调模型、不花 token。
 
@@ -27,7 +27,7 @@
 ```bash
 dsh plugin --profile <profile> add github:chibslee/dsh-session-search
 # 发布到 npm 之后也可以：
-dsh plugin --profile <profile> add dsh-session-finder
+dsh plugin --profile <profile> add dsh-keyword-searcher
 ```
 
 本地开发用链接方式：
