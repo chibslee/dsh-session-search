@@ -1,11 +1,11 @@
 window.__ModuleLoader__.load({
-  id: 'dsh-session-search',
+  id: 'dsh-session-finder',
   factory(require) {
     const React = require('react');
     const h = React.createElement;
     const { useState, useEffect, useCallback, useRef } = React;
 
-    const NS = 'dsh-session-search';
+    const NS = 'dsh-session-finder';
     const PANEL_ID = NS;
     // 从会话页顶部入口打开时记住是哪个会话，供“当前会话”范围使用。
     let lastActiveSessionId;

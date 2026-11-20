@@ -1,6 +1,6 @@
 {
-  "name": "dsh-session-search",
-  "version": "0.1.0",
+  "name": "dsh-session-finder",
+  "version": "0.1.1",
   "type": "module",
   "exports": {
     ".": "./index.js",
@@ -44,7 +44,8 @@
     "session-search",
     "full-text",
     "sqlite",
-    "fts5"
+    "fts5",
+    "session-finder"
   ],
   "repository": {
     "type": "git",
