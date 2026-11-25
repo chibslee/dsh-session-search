@@ -23,7 +23,7 @@ const TOOL_TYPES = ['tool/call', 'tool/result']
 const MARK_START = '\uFDD0'
 const MARK_END = '\uFDD1'
 
-const LIMITS = { ids: 40, perSession: 200, query: 200, tokenCount: 8, sessions: 200 }
+const LIMITS = { ids: 40, perSession: 1000, query: 200, tokenCount: 8, sessions: 200 }
 
 /** @returns {string} absolute path of the session-query index this deployment uses. */
 export function indexPath() {

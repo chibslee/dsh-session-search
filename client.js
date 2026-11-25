@@ -19,9 +19,6 @@ window.__ModuleLoader__.load({
     // 每次跳转自增：旧的异步跳转（等 loadThrough、等 DOM）看到令牌变了就自己退出，
     // 否则连按 Enter 会有多条跳转抢着滚，观感就是"上下乱跳"。
     let jumpToken = 0;
-    // 已经用 loadThrough 拉到的历史位置：seq >= 它的事件都已经在 DOM 里，不必再翻页。
-    let loadedThroughSeq = Infinity;
-    let loadedThroughSid = null;
     const findSubs = new Set();
     const notifyFind = () => { for (const fn of findSubs) fn(); };
     const subscribeFind = (fn) => { findSubs.add(fn); return () => { findSubs.delete(fn); }; };
@@ -211,6 +208,7 @@ window.__ModuleLoader__.load({
       'help.scope': '“含子会话 / 含归档”默认关闭：子代理跑的会话、已归档的会话不进结果，需要时自己勾上。按 ⌘⇧F（Ctrl+Shift+F）随时打开本页，Esc 返回。',
       'hint.findInSession': '只想在当前这场会话里找？在会话页按 ⌘F（Ctrl+F），查找条同样覆盖整段对话。',
       'find.whole': '全对话 {count} 处',
+      'find.wholeCapped': '全对话 {total} 处，可跳 {shown} 处',
       'find.loading': '正在加载历史并定位…',
       'find.old': '较旧的命中会按需加载历史',
       'hits.user': '你',
@@ -255,6 +253,7 @@ window.__ModuleLoader__.load({
       'help.scope': 'Sub-agent and archived sessions are excluded by default; tick the boxes when you want them. ⌘⇧F (Ctrl+Shift+F) opens this page from anywhere, Esc goes back.',
       'hint.findInSession': 'Looking inside the open session only? Press ⌘F (Ctrl+F) there — the find bar covers the whole conversation too.',
       'find.whole': '{count} in whole conversation',
+      'find.wholeCapped': '{total} in whole conversation, {shown} reachable',
       'find.loading': 'Loading history and locating…',
       'find.old': 'Older hits page history in on demand',
       'hits.user': 'You',
@@ -476,11 +475,33 @@ window.__ModuleLoader__.load({
       return out;
     }
 
+    // 找真正能滚的那个元素：宿主标记 [data-conversation-scroll] 不一定自身可滚
+    // （它可能是外壳，真滚动在其内部）；判错了 scrollTo 就是无声的 no-op。
+    function scrollHostFor(el) {
+      const canScroll = (node) => {
+        if (!node) return false;
+        try {
+          const cs = window.getComputedStyle(node);
+          const oy = cs.overflowY;
+          const scrolls = oy === 'auto' || oy === 'scroll' || oy === 'overlay';
+          return scrolls && node.scrollHeight > node.clientHeight + 8;
+        } catch (_) { return false; }
+      };
+      const marked = document.querySelector('[data-conversation-scroll]');
+      if (canScroll(marked)) return marked;
+      let cur = el ? el.parentElement : null;
+      while (cur && cur !== document.body && cur !== document.documentElement) {
+        if (canScroll(cur)) return cur;
+        cur = cur.parentElement;
+      }
+      return marked || null;
+    }
+
     // 只滚会话容器，不用 scrollIntoView：后者会连带滚外层容器（甚至窗口），
     // 和会话视口自己的锚点恢复打架，表现就是视口自己跳来跳去。
     function scrollElementIntoView(el, opts) {
       if (!el) return 0;
-      const scroller = document.querySelector('[data-conversation-scroll]');
+      const scroller = scrollHostFor(el);
       let rect = null;
       try { rect = el.getBoundingClientRect(); } catch (_) { rect = null; }
       if (!rect || !scroller) {
@@ -508,7 +529,8 @@ window.__ModuleLoader__.load({
 
     // 等目标那页消息真的挂进 DOM。旧版固定睡 240ms，历史页大时还没渲染完就去扫，
     // 扫到的是旧 DOM：轻则跳不到（看着"没响应"），重则挑错位置。
-    async function waitForLanding(needle, hint, token, timeoutMs) {
+    async function waitForLanding(needle, hint, token, timeoutMs, opts) {
+      const requireStrong = !!(opts && opts.requireStrong);
       const started = Date.now();
       let lastRows = -1;
       let lastScan = 0;
@@ -529,7 +551,9 @@ window.__ModuleLoader__.load({
               if (strong) return { matches, best };
             }
             // 超时了还没找到强匹配就退一步用当前最优，至少给个落点。
-            if (now - started >= timeoutMs) return { matches, best };
+            // 但"先看看目标是不是已经在这一页"的试探（requireStrong）不能退让：
+            // 退让就会挑错位置，那正是"点了不动 / 跳到别处"的来源。
+            if (!requireStrong && now - started >= timeoutMs) return { matches, best };
           }
         }
         if (now - started >= timeoutMs) return null;
@@ -545,6 +569,9 @@ window.__ModuleLoader__.load({
       const [revision, setRevision] = useState(0);
       // 整段对话（不只是已加载的 DOM）的命中共有多少条，用来给计数兜底。
       const [wholeTotal, setWholeTotal] = useState(0);
+      // 可跳转的条数：索引里的总数可能被 perSession 截断，计数分母必须用这个，
+      // 否则会出现"显示 5/277，但按到 201 就没反应了"。
+      const [wholeShown, setWholeShown] = useState(0);
       const [wholeIndex, setWholeIndex] = useState(-1);
       const [busy, setBusy] = useState(false);
       const busyRef = useRef(false);
@@ -657,23 +684,23 @@ window.__ModuleLoader__.load({
         if (!open) return;
         const needle = query.trim();
         const sid = findSessionId ? findSessionId() : undefined;
-        // 换会话了：之前翻到哪一页的记录作废。
-        if (sid !== loadedThroughSid) { loadedThroughSid = sid; loadedThroughSeq = Infinity; }
         if (!needle || !sid) {
           wholeHitsRef.current = [];
           wholeIndexRef.current = -1;
           setWholeTotal(0);
+          setWholeShown(0);
           setWholeIndex(-1);
           return;
         }
         const ac = (typeof AbortController !== 'undefined') ? new AbortController() : null;
         const timer = setTimeout(async () => {
-          const data = await fetchSessionHits(needle, [sid], 200, false, ac ? ac.signal : undefined);
+          const data = await fetchSessionHits(needle, [sid], 1000, false, ac ? ac.signal : undefined);
           if (!data || (ac && ac.signal.aborted)) return;
           const list = (data.hits || []).filter((hit) => hit.sessionId === sid).sort((a, b) => a.seq - b.seq);
           wholeHitsRef.current = list;
           wholeIndexRef.current = -1;
           setWholeIndex(-1);
+          setWholeShown(list.length);
           setWholeTotal(Number((data.counts && data.counts[sid]) || list.length));
         }, 220);
         return () => { clearTimeout(timer); if (ac) ac.abort(); };
@@ -701,7 +728,10 @@ window.__ModuleLoader__.load({
 
       const close = useCallback(() => { findOpen = false; notifyFind(); }, []);
 
-      // 跳到整段对话里的第 i 条：目标不在已加载的窗口里才翻历史，然后在 DOM 上定位。
+      // 跳到整段对话里的第 i 条。
+      // 顺序很重要：先看目标是不是已经在已加载的那一页（命中段落能对上就直接跳，不付翻页的钱），
+      // 对不上才 loadThrough(seq) 把历史拉回来。反过来（先按 seq 判断要不要翻页）会在
+      // "不知道当前加载到哪"时直接跳过翻页 —— 表现就是按上下箭头完全不动。
       const jumpWhole = useCallback(async (i) => {
         const list = wholeHitsRef.current;
         if (!list.length) return;
@@ -711,40 +741,41 @@ window.__ModuleLoader__.load({
         setWholeIndex(i);
         const hint = plainSnippet(hit && hit.snippet);
         const needle = query.trim();
-        // seq >= loadedThroughSeq 说明这条已经在 DOM 里，直接定位，不付翻页的钱。
-        const needsLoad = !!(hit && hit.seq) && hit.seq < loadedThroughSeq;
         busyRef.current = true;
         setBusy(true);
-        if (needsLoad) {
-          try { await loadThrough(hit.seq); } catch (_) { /* 拉失败就按现有 DOM 定位 */ }
-          if (token !== jumpToken) return;   // 期间又按了下一处，让新的那次接管
-          loadedThroughSeq = Math.min(loadedThroughSeq, hit.seq);
+        try {
+          let landed = await waitForLanding(needle, hint, token, 200, { requireStrong: true });
+          if (token !== jumpToken) return;
+          if (!landed && hit && hit.seq) {
+            try { await loadThrough(hit.seq); } catch (_) { /* 拉失败就按现有 DOM 定位 */ }
+            if (token !== jumpToken) return;   // 期间又按了下一处，让新的那次接管
+            landed = await waitForLanding(needle, hint, token, 2500);
+          }
+          if (token !== jumpToken || !landed) return;
+          matchesRef.current = landed.matches;
+          indexRef.current = landed.best;
+          setTotal(landed.matches.length);
+          setIndex(landed.best);
+          paintMatches(layerRef.current, landed.matches, landed.best);
+          if (landed.best < 0) return;
+          const el = landed.matches[landed.best].node.parentElement;
+          revealMatch(landed.matches[landed.best]);
+          // 会话视口自己也会恢复锚点（历史前插时），可能把我们顶走；一次有界校正。
+          setTimeout(() => {
+            if (token !== jumpToken || !el) return;
+            let rect = null;
+            try { rect = el.getBoundingClientRect(); } catch (_) { return; }
+            const scroller = scrollHostFor(el);
+            if (!rect || !scroller) return;
+            const box = scroller.getBoundingClientRect();
+            const drift = (rect.top + rect.height / 2) - (box.top + box.height / 2);
+            if (Math.abs(drift) > 60) scrollElementIntoView(el, { instant: true });
+            paintMatches(layerRef.current, matchesRef.current, indexRef.current);
+          }, 280);
+        } finally {
+          // 任何出口都要清 busy：令牌被抢走时早退，否则计数永远停在 '…' 且不再重算。
+          if (token === jumpToken) { busyRef.current = false; setBusy(false); }
         }
-        const landed = await waitForLanding(needle, hint, token, needsLoad ? 2500 : 500);
-        if (token !== jumpToken) return;
-        busyRef.current = false;
-        setBusy(false);
-        if (!landed) return;
-        matchesRef.current = landed.matches;
-        indexRef.current = landed.best;
-        setTotal(landed.matches.length);
-        setIndex(landed.best);
-        paintMatches(layerRef.current, landed.matches, landed.best);
-        if (landed.best < 0) return;
-        const el = landed.matches[landed.best].node.parentElement;
-        revealMatch(landed.matches[landed.best]);
-        // 会话视口自己也会恢复锚点（历史前插时），可能把我们顶走；一次有界校正。
-        setTimeout(() => {
-          if (token !== jumpToken || !el) return;
-          let rect = null;
-          try { rect = el.getBoundingClientRect(); } catch (_) { return; }
-          const scroller = document.querySelector('[data-conversation-scroll]');
-          if (!rect || !scroller) return;
-          const box = scroller.getBoundingClientRect();
-          const drift = (rect.top + rect.height / 2) - (box.top + box.height / 2);
-          if (Math.abs(drift) > 60) scrollElementIntoView(el, { instant: true });
-          paintMatches(layerRef.current, matchesRef.current, indexRef.current);
-        }, 280);
       }, [loadThrough, query]);
 
       const step = useCallback((dir) => {
@@ -766,10 +797,15 @@ window.__ModuleLoader__.load({
 
       if (!open) return null;
 
-      // 索引里的总数才是"整段对话"的真实命中数；DOM 里的可能只是已加载的部分。
-      const shownTotal = wholeTotal > total ? wholeTotal : total;
-      const shownIndex = wholeTotal > total ? (wholeIndex >= 0 ? wholeIndex + 1 : 1) : (index >= 0 ? index + 1 : 1);
+      // 分母用"可跳转的条数"（索引命中列表），不是索引里的事件总数 —— 两者可能不等。
+      const shownTotal = wholeShown > 0 ? wholeShown : total;
+      const shownIndex = wholeShown > 0 ? (wholeIndex >= 0 ? wholeIndex + 1 : 1) : (index >= 0 ? index + 1 : 1);
       const counter = busy ? '…' : (shownTotal ? shownIndex + '/' + shownTotal : '0/0');
+      const countTitle = busy
+        ? t('find.loading')
+        : (wholeTotal > shownTotal
+          ? t('find.wholeCapped', { total: wholeTotal, shown: shownTotal })
+          : (wholeTotal > 0 ? t('find.whole', { count: wholeTotal }) : undefined));
 
       return h(React.Fragment, null, h(Styles),
         h('div', { className: 'ssv-findLayer', ref: layerRef, 'aria-hidden': true }),
@@ -786,7 +822,8 @@ window.__ModuleLoader__.load({
         h('span', {
           className: 'ssv-findCount',
           'data-busy': busy ? 'true' : undefined,
-          title: busy ? t('find.loading') : (wholeTotal > total ? t('find.whole', { count: wholeTotal }) : undefined),
+          'aria-busy': busy ? 'true' : undefined,
+          title: countTitle,
         }, counter),
         h('button', { type: 'button', className: 'ssv-findBtn', title: t('find.prev'), 'aria-label': t('find.prev'), disabled: shownTotal === 0, onClick: () => step(-1) }, h(Glyph, { d: 'M18 15l-6-6-6 6' })),
         h('button', { type: 'button', className: 'ssv-findBtn', title: t('find.next'), 'aria-label': t('find.next'), disabled: shownTotal === 0, onClick: () => step(1) }, h(Glyph, { d: 'M6 9l6 6 6-6' })),
