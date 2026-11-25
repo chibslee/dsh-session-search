@@ -16,6 +16,12 @@ window.__ModuleLoader__.load({
     let findSeededQuery = '';
     // { hint }：等命中算完，挑与这条命中 snippet 最吻合的那一处并滚过去。
     let pendingReveal = null;
+    // 每次跳转自增：旧的异步跳转（等 loadThrough、等 DOM）看到令牌变了就自己退出，
+    // 否则连按 Enter 会有多条跳转抢着滚，观感就是"上下乱跳"。
+    let jumpToken = 0;
+    // 已经用 loadThrough 拉到的历史位置：seq >= 它的事件都已经在 DOM 里，不必再翻页。
+    let loadedThroughSeq = Infinity;
+    let loadedThroughSid = null;
     const findSubs = new Set();
     const notifyFind = () => { for (const fn of findSubs) fn(); };
     const subscribeFind = (fn) => { findSubs.add(fn); return () => { findSubs.delete(fn); }; };
@@ -205,6 +211,7 @@ window.__ModuleLoader__.load({
       'help.scope': '“含子会话 / 含归档”默认关闭：子代理跑的会话、已归档的会话不进结果，需要时自己勾上。按 ⌘⇧F（Ctrl+Shift+F）随时打开本页，Esc 返回。',
       'hint.findInSession': '只想在当前这场会话里找？在会话页按 ⌘F（Ctrl+F），查找条同样覆盖整段对话。',
       'find.whole': '全对话 {count} 处',
+      'find.loading': '正在加载历史并定位…',
       'find.old': '较旧的命中会按需加载历史',
       'hits.user': '你',
       'hits.assistant': 'AI',
@@ -248,6 +255,7 @@ window.__ModuleLoader__.load({
       'help.scope': 'Sub-agent and archived sessions are excluded by default; tick the boxes when you want them. ⌘⇧F (Ctrl+Shift+F) opens this page from anywhere, Esc goes back.',
       'hint.findInSession': 'Looking inside the open session only? Press ⌘F (Ctrl+F) there — the find bar covers the whole conversation too.',
       'find.whole': '{count} in whole conversation',
+      'find.loading': 'Loading history and locating…',
       'find.old': 'Older hits page history in on demand',
       'hits.user': 'You',
       'hits.assistant': 'AI',
@@ -279,6 +287,7 @@ window.__ModuleLoader__.load({
 .ssv-find{position:fixed;top:calc(54px + var(--dsh-frame-top-clearance,0px));right:22px;z-index:70;display:flex;align-items:center;gap:4px;padding:6px 6px 6px 8px;border-radius:12px;background:var(--dsw-alias-bg-raised,var(--dsw-alias-bg-base));border:.5px solid var(--dsw-alias-border-l2);box-shadow:var(--dsw-elevation-mid,0 10px 28px rgba(0,0,0,.32))}
 .ssv-findInput{box-sizing:border-box;width:210px;height:28px;padding:0 8px;font:inherit;font-size:13px;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-interactive-bg-hover);border:.5px solid var(--dsw-alias-border-l3);border-radius:8px;outline:0}
 .ssv-findInput:focus{border-color:var(--dsw-alias-state-business-primary)}
+.ssv-findCount[data-busy="true"]{opacity:.55}
 .ssv-findCount{min-width:46px;padding:0 2px;text-align:right;font-size:12px;line-height:24px;color:var(--dsw-alias-label-tertiary);font-variant-numeric:tabular-nums;white-space:nowrap}
 .ssv-findBtn{display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;padding:0;color:var(--dsw-alias-label-secondary);background:0 0;border:0;border-radius:6px;cursor:pointer}
 .ssv-findBtn:hover:not(:disabled){color:var(--dsw-alias-label-primary);background:var(--dsw-alias-interactive-bg-hover)}
@@ -467,10 +476,65 @@ window.__ModuleLoader__.load({
       return out;
     }
 
-    function revealMatch(match) {
+    // 只滚会话容器，不用 scrollIntoView：后者会连带滚外层容器（甚至窗口），
+    // 和会话视口自己的锚点恢复打架，表现就是视口自己跳来跳去。
+    function scrollElementIntoView(el, opts) {
+      if (!el) return 0;
+      const scroller = document.querySelector('[data-conversation-scroll]');
+      let rect = null;
+      try { rect = el.getBoundingClientRect(); } catch (_) { rect = null; }
+      if (!rect || !scroller) {
+        try { el.scrollIntoView({ block: 'center', behavior: 'auto' }); } catch (_) { /* 放弃 */ }
+        return 0;
+      }
+      const box = scroller.getBoundingClientRect();
+      const delta = (rect.top + rect.height / 2) - (box.top + box.height / 2);
+      if (Math.abs(delta) < 8) return delta;
+      // 远距离直接落位：长距离 smooth 动画会持续几百毫秒，期间任何锚点修正都会把落点拽走。
+      const far = Math.abs(delta) > box.height * 0.9 || (opts && opts.instant);
+      const top = scroller.scrollTop + delta;
+      try {
+        scroller.scrollTo({ top, behavior: far ? 'auto' : 'smooth' });
+      } catch (_) {
+        scroller.scrollTop = top;
+      }
+      return delta;
+    }
+
+    function revealMatch(match, opts) {
       const el = match && match.node ? match.node.parentElement : null;
-      if (!el || typeof el.scrollIntoView !== 'function') return;
-      try { el.scrollIntoView({ block: 'center', behavior: 'smooth' }); } catch { el.scrollIntoView(); }
+      return scrollElementIntoView(el, opts);
+    }
+
+    // 等目标那页消息真的挂进 DOM。旧版固定睡 240ms，历史页大时还没渲染完就去扫，
+    // 扫到的是旧 DOM：轻则跳不到（看着"没响应"），重则挑错位置。
+    async function waitForLanding(needle, hint, token, timeoutMs) {
+      const started = Date.now();
+      let lastRows = -1;
+      let lastScan = 0;
+      for (;;) {
+        if (token !== jumpToken) return null;
+        const now = Date.now();
+        const root = document.querySelector('[data-conversation-scroll]');
+        const rows = root ? root.querySelectorAll('[data-chat-anchor-key]').length : 0;
+        // 行数没变也每 250ms 重扫一次：虚拟列表可能换掉整页行而总数不变。
+        if (rows !== lastRows || now - lastScan >= 250) {
+          lastRows = rows;
+          lastScan = now;
+          const matches = collectMatches(root, needle);
+          if (matches.length) {
+            const best = pickBestMatch(matches, hint);
+            if (best >= 0) {
+              const strong = !hint || contextScore(rowOf(matches[best].node), hint) > 0;
+              if (strong) return { matches, best };
+            }
+            // 超时了还没找到强匹配就退一步用当前最优，至少给个落点。
+            if (now - started >= timeoutMs) return { matches, best };
+          }
+        }
+        if (now - started >= timeoutMs) return null;
+        await new Promise((resolve) => { setTimeout(resolve, 60); });
+      }
     }
 
     function FindBar({ t, loadThrough, findSessionId }) {
@@ -482,6 +546,8 @@ window.__ModuleLoader__.load({
       // 整段对话（不只是已加载的 DOM）的命中共有多少条，用来给计数兜底。
       const [wholeTotal, setWholeTotal] = useState(0);
       const [wholeIndex, setWholeIndex] = useState(-1);
+      const [busy, setBusy] = useState(false);
+      const busyRef = useRef(false);
       const wholeHitsRef = useRef([]);
       const wholeIndexRef = useRef(-1);
       const matchesRef = useRef([]);
@@ -528,6 +594,9 @@ window.__ModuleLoader__.load({
         if (!open) return;
         let timer = 0;
         const observer = new MutationObserver((records) => {
+          // 正在翻历史定位时先不重算：这段时间 DOM 必然在变，重算是纯浪费，
+          // 而且会跟跳转抢着重绘色块。
+          if (busyRef.current || document.hidden) return;
           const relevant = records.some((record) => {
             const node = record.target;
             const el = node && node.nodeType === 1 ? node : (node && node.parentElement);
@@ -535,7 +604,7 @@ window.__ModuleLoader__.load({
           });
           if (!relevant) return;
           clearTimeout(timer);
-          timer = setTimeout(() => setRevision((v) => v + 1), 300);
+          timer = setTimeout(() => setRevision((v) => v + 1), 420);
         });
         observer.observe(document.body, { childList: true, subtree: true, characterData: true });
         return () => { observer.disconnect(); clearTimeout(timer); };
@@ -571,10 +640,11 @@ window.__ModuleLoader__.load({
           setIndex(next);
           paintMatches(layerRef.current, matches, next);
           // 只有关键词变了（或从结果页指定了落点）才把视图拉过去；流式/切会话引起的重算不动视口。
-          if ((changed || jump) && next >= 0) revealMatch(matches[next]);
+          if (!busyRef.current && (changed || jump) && next >= 0) revealMatch(matches[next]);
           // 懒加载 / 代码块 / 图片落位会把文字推走，落定后再画一次。
           clearTimeout(settle);
           settle = setTimeout(() => {
+            if (busyRef.current) return;
             paintMatches(layerRef.current, matchesRef.current, indexRef.current);
           }, 320);
         }, 140);
@@ -587,6 +657,8 @@ window.__ModuleLoader__.load({
         if (!open) return;
         const needle = query.trim();
         const sid = findSessionId ? findSessionId() : undefined;
+        // 换会话了：之前翻到哪一页的记录作废。
+        if (sid !== loadedThroughSid) { loadedThroughSid = sid; loadedThroughSeq = Infinity; }
         if (!needle || !sid) {
           wholeHitsRef.current = [];
           wholeIndexRef.current = -1;
@@ -629,28 +701,50 @@ window.__ModuleLoader__.load({
 
       const close = useCallback(() => { findOpen = false; notifyFind(); }, []);
 
-      // 跳到整段对话里的第 i 条：先把那条事件所在的历史页加载回来，再在 DOM 上定位。
+      // 跳到整段对话里的第 i 条：目标不在已加载的窗口里才翻历史，然后在 DOM 上定位。
       const jumpWhole = useCallback(async (i) => {
         const list = wholeHitsRef.current;
         if (!list.length) return;
         const hit = list[(i + list.length) % list.length];
+        const token = (jumpToken += 1);
         wholeIndexRef.current = i;
         setWholeIndex(i);
-        if (hit && hit.seq) {
-          try { await loadThrough(hit.seq); } catch (_) { /* 加载失败就只按当前 DOM 定位 */ }
-        }
-        // 等新加载的那页消息挂进 DOM
-        await new Promise((resolve) => { setTimeout(resolve, 240); });
+        const hint = plainSnippet(hit && hit.snippet);
         const needle = query.trim();
-        const root = document.querySelector('[data-conversation-scroll]');
-        const matches = collectMatches(root, needle);
-        matchesRef.current = matches;
-        const best = pickBestMatch(matches, plainSnippet(hit && hit.snippet));
-        indexRef.current = best;
-        setTotal(matches.length);
-        setIndex(best);
-        paintMatches(layerRef.current, matches, best);
-        if (best >= 0) revealMatch(matches[best]);
+        // seq >= loadedThroughSeq 说明这条已经在 DOM 里，直接定位，不付翻页的钱。
+        const needsLoad = !!(hit && hit.seq) && hit.seq < loadedThroughSeq;
+        busyRef.current = true;
+        setBusy(true);
+        if (needsLoad) {
+          try { await loadThrough(hit.seq); } catch (_) { /* 拉失败就按现有 DOM 定位 */ }
+          if (token !== jumpToken) return;   // 期间又按了下一处，让新的那次接管
+          loadedThroughSeq = Math.min(loadedThroughSeq, hit.seq);
+        }
+        const landed = await waitForLanding(needle, hint, token, needsLoad ? 2500 : 500);
+        if (token !== jumpToken) return;
+        busyRef.current = false;
+        setBusy(false);
+        if (!landed) return;
+        matchesRef.current = landed.matches;
+        indexRef.current = landed.best;
+        setTotal(landed.matches.length);
+        setIndex(landed.best);
+        paintMatches(layerRef.current, landed.matches, landed.best);
+        if (landed.best < 0) return;
+        const el = landed.matches[landed.best].node.parentElement;
+        revealMatch(landed.matches[landed.best]);
+        // 会话视口自己也会恢复锚点（历史前插时），可能把我们顶走；一次有界校正。
+        setTimeout(() => {
+          if (token !== jumpToken || !el) return;
+          let rect = null;
+          try { rect = el.getBoundingClientRect(); } catch (_) { return; }
+          const scroller = document.querySelector('[data-conversation-scroll]');
+          if (!rect || !scroller) return;
+          const box = scroller.getBoundingClientRect();
+          const drift = (rect.top + rect.height / 2) - (box.top + box.height / 2);
+          if (Math.abs(drift) > 60) scrollElementIntoView(el, { instant: true });
+          paintMatches(layerRef.current, matchesRef.current, indexRef.current);
+        }, 280);
       }, [loadThrough, query]);
 
       const step = useCallback((dir) => {
@@ -675,11 +769,11 @@ window.__ModuleLoader__.load({
       // 索引里的总数才是"整段对话"的真实命中数；DOM 里的可能只是已加载的部分。
       const shownTotal = wholeTotal > total ? wholeTotal : total;
       const shownIndex = wholeTotal > total ? (wholeIndex >= 0 ? wholeIndex + 1 : 1) : (index >= 0 ? index + 1 : 1);
-      const counter = shownTotal ? shownIndex + '/' + shownTotal : '0/0';
+      const counter = busy ? '…' : (shownTotal ? shownIndex + '/' + shownTotal : '0/0');
 
       return h(React.Fragment, null, h(Styles),
         h('div', { className: 'ssv-findLayer', ref: layerRef, 'aria-hidden': true }),
-        h('div', { className: 'ssv-find', role: 'search' },
+        h('div', { className: 'ssv-find', role: 'search', 'aria-busy': busy ? 'true' : 'false' },
         h('input', {
           ref: inputRef, type: 'text', className: 'ssv-findInput', value: query,
           placeholder: t('find.placeholder'), 'aria-label': t('find.placeholder'),
@@ -691,7 +785,8 @@ window.__ModuleLoader__.load({
         }),
         h('span', {
           className: 'ssv-findCount',
-          title: wholeTotal > total ? t('find.whole', { count: wholeTotal }) : undefined,
+          'data-busy': busy ? 'true' : undefined,
+          title: busy ? t('find.loading') : (wholeTotal > total ? t('find.whole', { count: wholeTotal }) : undefined),
         }, counter),
         h('button', { type: 'button', className: 'ssv-findBtn', title: t('find.prev'), 'aria-label': t('find.prev'), disabled: shownTotal === 0, onClick: () => step(-1) }, h(Glyph, { d: 'M18 15l-6-6-6 6' })),
         h('button', { type: 'button', className: 'ssv-findBtn', title: t('find.next'), 'aria-label': t('find.next'), disabled: shownTotal === 0, onClick: () => step(1) }, h(Glyph, { d: 'M6 9l6 6 6-6' })),

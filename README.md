@@ -66,6 +66,14 @@ dsh plugin --profile <profile> add /absolute/path/to/dsh-session-search
 - **空格分词、AND 组合**：`缓存 清理` 要求两个词都出现。
 - **中文按连续字串**，英文不区分大小写；标点、引号按普通字符处理。
 
+### 定位行为（0.1.2 起）
+
+- 跳到更早的命中时，只有目标事件不在已加载窗口里才翻历史；翻过的位置会记住，同一场会话里后续跳转不再翻页。
+- 翻页期间计数显示 `…`（`aria-busy`），落位靠"等目标消息真的挂进 DOM"而不是固定 sleep，超时上限 2.5s。
+- 连按 `Enter` 只保留最后一次跳转，旧的异步跳转自己退出 —— 不会几条跳转抢着滚。
+- 只滚会话滚动容器，不用 `scrollIntoView`（后者会连带滚外层容器，和会话视口自己的锚点恢复打架，观感是"上下乱跳"）。
+- 远距离落位瞬时到位、近距离才用平滑动画；历史前插导致视口被顶走时做一次有界校正（>60px 才纠）。
+
 ## 实现
 
 - `client.js`：手写的 module-loader 产物（`window.__ModuleLoader__.load({...})`），注册四个插槽 —— `main`（面板）、`sidebar.panellist`（入口）、`conversation.session.header.utilities`（放大镜）、`shell.overlay`（查找条与高亮层）。

@@ -1,6 +1,6 @@
 {
   "name": "dsh-keyword-searcher",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "type": "module",
   "exports": {
     ".": "./index.js",
@@ -37,6 +37,9 @@
   },
   "description": "DSH sidebar panel: local full-text search across every session record, with per-message hits and click-to-locate. No model calls.",
   "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
   "keywords": [
     "dsh",
     "dsh-plugin",
