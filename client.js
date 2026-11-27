@@ -577,6 +577,14 @@ window.__ModuleLoader__.load({
       const busyRef = useRef(false);
       const wholeHitsRef = useRef([]);
       const wholeIndexRef = useRef(-1);
+      // 点「下一个」时如果上一次跳转还在落位，把方向记下来等它落定再补跳，
+      // 而不是像以前那样直接作废 —— 作废的表现就是"按了没反应"。
+      const pendingStepsRef = useRef([]);
+      // 关键词变了但索引还没回来（220ms 去抖 + 一次 HTTP）：此时按 Enter 不能退回到
+      // 只认已渲染 DOM 的分支，否则会跳到错的地方或干脆不动。
+      const indexForRef = useRef(null);
+      // 队列里的方向要等异步落位结束后才执行，只能通过 ref 拿到最新的 step。
+      const stepRef = useRef(null);
       const matchesRef = useRef([]);
       const indexRef = useRef(-1);
       const lastQueryRef = useRef(null);
@@ -687,21 +695,44 @@ window.__ModuleLoader__.load({
         if (!needle || !sid) {
           wholeHitsRef.current = [];
           wholeIndexRef.current = -1;
+          pendingStepsRef.current = [];
+          indexForRef.current = null;
           setWholeTotal(0);
           setWholeShown(0);
           setWholeIndex(-1);
           return;
         }
+        // 关键词变了：排队里的方向是针对上一个关键词的，丢掉。
+        // 同时把上一轮的关键词命中列表清空 —— 留着它，敲完新词立刻按「下一个」
+        // 会拿旧列表里的 seq 去跳，表现就是"跳到完全无关的地方"。
+        pendingStepsRef.current = [];
+        if (indexForRef.current !== needle) {
+          wholeHitsRef.current = [];
+          wholeIndexRef.current = -1;
+          setWholeShown(0);
+        }
         const ac = (typeof AbortController !== 'undefined') ? new AbortController() : null;
         const timer = setTimeout(async () => {
           const data = await fetchSessionHits(needle, [sid], 1000, false, ac ? ac.signal : undefined);
-          if (!data || (ac && ac.signal.aborted)) return;
+          if (ac && ac.signal.aborted) return;
+          if (!data) {
+            // 逐条命中路由不可用（或请求失败）：仍然标记"这个关键词已经试过索引"，
+            // 否则 step 会一直以为索引在路上，把每次 Enter 都排进队列而永不执行。
+            indexForRef.current = needle;
+            const queued = pendingStepsRef.current.shift();
+            if (queued !== undefined) stepRef.current(queued);
+            return;
+          }
           const list = (data.hits || []).filter((hit) => hit.sessionId === sid).sort((a, b) => a.seq - b.seq);
           wholeHitsRef.current = list;
           wholeIndexRef.current = -1;
           setWholeIndex(-1);
           setWholeShown(list.length);
           setWholeTotal(Number((data.counts && data.counts[sid]) || list.length));
+          indexForRef.current = needle;
+          // 关键词敲完立刻按 Enter 时，跳转被"索引还没回来"挡下过一次；索引到了就补跳。
+          const queued = pendingStepsRef.current.shift();
+          if (queued !== undefined) stepRef.current(queued);
         }, 220);
         return () => { clearTimeout(timer); if (ac) ac.abort(); };
       }, [open, query, findSessionId]);
@@ -774,13 +805,35 @@ window.__ModuleLoader__.load({
           }, 280);
         } finally {
           // 任何出口都要清 busy：令牌被抢走时早退，否则计数永远停在 '…' 且不再重算。
-          if (token === jumpToken) { busyRef.current = false; setBusy(false); }
+          if (token === jumpToken) {
+            busyRef.current = false;
+            setBusy(false);
+            // 落位期间按下的方向在这里补跳：一次只补一个，剩下的一次跳完再补，
+            // 这样连按 3 次就是稳稳走 3 步，不会互相抢令牌而全部作废。
+            const queued = pendingStepsRef.current.shift();
+            if (queued !== undefined) stepRef.current(queued);
+          }
         }
       }, [loadThrough, query]);
 
       const step = useCallback((dir) => {
+        // 排队上限：按住 Enter 不放时 keydown 连发，不封顶会攒出几百步，
+        // 松手后页面自己在那跳半分钟。超过 20 步只保留最后一次方向。
+        const push = (d) => {
+          const q = pendingStepsRef.current;
+          if (q.length >= 20) q[q.length - 1] = d;
+          else q.push(d);
+        };
         const whole = wholeHitsRef.current;
+        // 顺序：先确认"这个关键词的索引算过了"，再看有没有命中列表。
+        // 反过来的话，敲完新词立刻按「下一个」会拿上一个关键词的命中去跳 —— 跳到无关位置。
+        if (query.trim() && indexForRef.current !== query.trim()) {
+          push(dir);
+          return;
+        }
         if (whole.length > 0) {
+          // 上一次还在落位：记下方向，等它落定后补跳（见上面 finally）。
+          if (busyRef.current) { push(dir); return; }
           const cur = wholeIndexRef.current;
           jumpWhole(cur < 0 ? (dir > 0 ? 0 : whole.length - 1) : (cur + dir + whole.length) % whole.length);
           return;
@@ -794,6 +847,11 @@ window.__ModuleLoader__.load({
         paintMatches(layerRef.current, matches, next);
         revealMatch(matches[next]);
       }, [jumpWhole]);
+
+      stepRef.current = step;
+
+      // 按钮按下时别让浏览器把焦点移到按钮上（那会让输入框失焦，接着敲字就丢了）。
+      const keepFocus = (e) => { e.preventDefault(); };
 
       if (!open) return null;
 
@@ -815,8 +873,20 @@ window.__ModuleLoader__.load({
           placeholder: t('find.placeholder'), 'aria-label': t('find.placeholder'),
           onChange: (e) => setQuery(e.target.value),
           onKeyDown: (e) => {
-            if (e.key === 'Enter') { e.preventDefault(); step(e.shiftKey ? -1 : 1); }
-            else if (e.key === 'Escape') { e.preventDefault(); close(); }
+            // 输入法组字时的 Enter 是"提交候选"，不是"下一个"。
+            if (e.isComposing || e.keyCode === 229) return;
+            if (e.key === 'Enter') {
+              e.preventDefault();
+              e.stopPropagation();
+              // 按住 Enter 时 keydown 会连发（e.repeat）。排队上限 3 步：既能"按住往下连跳"，
+              // 又不会松手后自己在那跳半天。
+              if (e.repeat && pendingStepsRef.current.length >= 3) return;
+              step(e.shiftKey ? -1 : 1);
+            } else if (e.key === 'Escape') {
+              e.preventDefault();
+              e.stopPropagation();
+              close();
+            }
           },
         }),
         h('span', {
@@ -825,8 +895,10 @@ window.__ModuleLoader__.load({
           'aria-busy': busy ? 'true' : undefined,
           title: countTitle,
         }, counter),
-        h('button', { type: 'button', className: 'ssv-findBtn', title: t('find.prev'), 'aria-label': t('find.prev'), disabled: shownTotal === 0, onClick: () => step(-1) }, h(Glyph, { d: 'M18 15l-6-6-6 6' })),
-        h('button', { type: 'button', className: 'ssv-findBtn', title: t('find.next'), 'aria-label': t('find.next'), disabled: shownTotal === 0, onClick: () => step(1) }, h(Glyph, { d: 'M6 9l6 6 6-6' })),
+        // 点按钮别把输入框的焦点抢走：抢走之后接着敲字就进不了搜索框，
+        // 观感是"点了下一个再输入没反应"。
+        h('button', { type: 'button', className: 'ssv-findBtn', title: t('find.prev'), 'aria-label': t('find.prev'), disabled: shownTotal === 0, onMouseDown: keepFocus, onClick: () => step(-1) }, h(Glyph, { d: 'M18 15l-6-6-6 6' })),
+        h('button', { type: 'button', className: 'ssv-findBtn', title: t('find.next'), 'aria-label': t('find.next'), disabled: shownTotal === 0, onMouseDown: keepFocus, onClick: () => step(1) }, h(Glyph, { d: 'M6 9l6 6 6-6' })),
         h('button', { type: 'button', className: 'ssv-findBtn', title: t('find.close'), 'aria-label': t('find.close'), onClick: close }, h(Glyph, { d: 'M6 6l12 12M18 6L6 18' }))
       ));
     }

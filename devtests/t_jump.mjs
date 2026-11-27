@@ -205,6 +205,44 @@ const r4 = await page.evaluate(async ({ hit, queue }) => {
 
 check('loadThrough 抛错后 busy 也复位', r4.busySets === false, String(r4.busySets));
 
+// ---- 场景 5：落位期间连按「下一个」不丢步（以前每次都作废上一次 → 表现"按了没反应"）
+// refs 顺序：busyRef0 wholeHitsRef1 wholeIndexRef2 pendingStepsRef3 indexForRef4 stepRef5 …
+const hits10 = Array.from({ length: 10 }, (_, k) => ({
+  sessionId: 's1', seq: 100 + k, type: 'assistant/message', time: 1, surface: 'current',
+  snippet: 'older \uFDD0cluster\uFDD1 text here',
+}));
+const r5 = await page.evaluate(async ({ hits, queue }) => {
+  const app = window.__boot(queue.concat([]), hits);
+  const step = window.__h.cbs[2];
+  if (typeof step !== 'function') return { error: 'no step' };
+  app.refs[4].current = 'cluster';   // 索引已就绪
+  app.refs[2].current = -1;
+  const p = app.jumpWhole(0);        // 第 0 条，落位中
+  step(1); step(1);                  // 落位期间连按两下
+  const queuedDuring = app.refs[3].current.length;
+  await p;
+  await new Promise((r) => setTimeout(r, 1500));   // 等补跳跑完
+  return { queuedDuring, finalIndex: app.refs[2].current, left: app.refs[3].current.length };
+}, { hits: hits10, queue: QUEUE });
+
+if (r5.error) console.log('R5 ERROR:', r5.error);
+check('落位期间的按键被排队而不是丢弃', r5.queuedDuring === 2, `queued=${r5.queuedDuring}`);
+check('排队的两步都执行了（0→1→2）', r5.finalIndex === 2, `index=${r5.finalIndex}`);
+check('补跳跑完后队列清空', r5.left === 0, `left=${r5.left}`);
+
+// ---- 场景 6：关键词刚敲完、索引还没回来时按「下一个」不能退回只看 DOM 的分支
+const r6 = await page.evaluate(async ({ hit, queue }) => {
+  const app = window.__boot(queue, [hit]);
+  const step = window.__h.cbs[2];
+  app.refs[4].current = null;          // 索引还没回来
+  app.refs[2].current = -1;
+  app.refs[3].current.length = 0;
+  step(1);
+  return { queued: app.refs[3].current.slice() };
+}, { hit: HIT, queue: QUEUE });
+
+check('索引未就绪时按下一个先排队', r6.queued.length === 1 && r6.queued[0] === 1, JSON.stringify(r6.queued));
+
 await browser.close();
 
 let failed = 0;
